@@ -16,7 +16,6 @@
  * Based on various other drivers including Xiaomi Aqara Mijia Sensors and Switches, Nue Temp Humidity Sensor and others
  *
  * TODO
- * - Implement Humidity offset
  * - Configuration and timings of reporting needs work
  * - Understand and implement handling of catchall events
  */
@@ -31,7 +30,11 @@ metadata {
         capability "Refresh"
         
    		attribute "voltage", "number"
+
+        command "codeTest"
+        command "resetToDefaults"
         
+        // Home Automation Profile = 0104
         fingerprint profileId: "0104", deviceId: "", inClusters:"0000,0001,0003,0402,0405", outClusters:"0003,0402,0405", manufacturer:"TUYATEC-Bfq2i2Sy", model:"RH3052", deviceJoinName: "T&H Zigbee Temp Humidity Sensor"
     }
     preferences {
@@ -39,60 +42,92 @@ metadata {
 		input name: "presenceHours", type: "enum", title: "Presence Timeout", description: "The number of hours before a device is considered 'not present'.<br>Note: Some of these devices only update their battery every 6 hours.", defaultValue: "12", options: ["1","2","3","4","6","12","24"]
 		input name: "temperatureOffset", type: "number", title: "Temperature Offset", description: "This setting compensates for an inaccurate temperature sensor. For example, set to -7 if the temperature is 7 degress too warm.", defaultValue: "0"
 		input name: "humidityOffset", type: "number", title: "Humidity Offset", description: "This setting compensates for an inaccurate humidity sensor. For example, set to -7 if the humidity is 7% too high.", defaultValue: "0"
-	}
+    }
 }
 
 // Callacks
 
 def parse(String description) {
-    
-    if (description?.startsWith("read attr")) {
-        def descMap = zigbee.parseDescriptionAsMap(description)
-        
-        if (descMap.cluster == "0001" && descMap.attrId == "0020") {
-			batteryVoltageEvent(Integer.parseInt(descMap.value, 16))
-		} else if (descMap.cluster == "0001" && descMap.attrId == "0021") {
-            batteryPercentageEvent(Integer.parseInt(descMap.value, 16))
-		} else if (descMap.cluster == "0402" && descMap.attrId == "0000") {
-            temperatureEvent(hexStrToSignedInt(descMap.value))
-		} else if (descMap.cluster == "0405" && descMap.attrId == "0000") {
-			humidityEvent(Integer.parseInt(descMap.value, 16))
-		} else if (descMap.cluster == "0000" && descMap.attrId == "0001") {
-            log.info "${device.displayName} ApplicationVersion ${descMap.value}"
-        } else {
-            log.error "${device.displayName} unknown cluster and attribute ${descMap}"
-        }
-    } else if (description?.startsWith("catchall")) {
-        def descMap = zigbee.parseDescriptionAsMap(description)
-        if (descMap.cluster != null) {
-            def cluster = zigbee.clusterLookup(descMap.cluster)
-            log.info "${device.displayName} cluster ${cluster.clusterLabel} reported"
-        }
-        if (descMap.cluster == "0001") {
-            // 
-        } else if (descMap.cluster == "0006") {
-            // Device On Off?
-            if (descMap.command == "01") {
-                log.info "${device.displayName} turned on"
-            }
-        } else if (descMap.cluster == "8021") {
-        }
-        log.warn "${device.displayName} unsupported catchall ${descMap}"
-    } else {
-        log.error "${device.displayName} unsupported description ${description}"
-    }
-    
-    if (presenceDetect != false) {
+
+    if (presenceDetect != false) {    // Null or True
 		unschedule(presenceTracker)
 		if (device.currentValue("presence") != "present") {
             present()
 		}
 		presenceStart()
 	}
+    def descMap = zigbee.parseDescriptionAsMap(description)
+    if (descMap.cluster != null || descMap.clusterId != null) {
+        def lookup = descMap.cluster != null ? descMap.cluster : descMap.clusterId
+        def cluster = zigbee.clusterLookup(lookup)
+        log.debug "${device.displayName} cluster ${cluster.clusterLabel} from message ${lookup}"
+    }
+    
+    if (description?.startsWith("read attr")) {
+		if (descMap.cluster == "0000" && descMap.attrId == "0001") {
+            log.info "${device.displayName} Application Version ${descMap.value}"
+		} else if (descMap.cluster == "0000" && descMap.attrId == "0004") {
+            log.info "${device.displayName} Manufacturer Name ${descMap.value}"
+		} else if (descMap.cluster == "0000" && descMap.attrId == "0005") {
+            log.info "${device.displayName} Model ID ${descMap.value}"
+        } else if (descMap.cluster == "0001" && descMap.attrId == "0020") {
+			batteryVoltageEvent(Integer.parseInt(descMap.value, 16))
+            return [:]
+		} else if (descMap.cluster == "0001" && descMap.attrId == "0021") {
+            batteryPercentageEvent(Integer.parseInt(descMap.value, 16))
+            return [:]
+		} else if (descMap.cluster == "0402" && descMap.attrId == "0000") {
+            temperatureEvent(hexStrToSignedInt(descMap.value))
+            return [:]
+		} else if (descMap.cluster == "0403" && descMap.attrId == "0000") {
+            pressureEvent(Integer.parseInt(descMap.value, 16))
+            return [:]
+		} else if (descMap.cluster == "0405" && descMap.attrId == "0000") {
+			humidityEvent(Integer.parseInt(descMap.value, 16))
+            return [:]
+		} else if (descMap.cluster == "0000" && descMap.attrId == "FF01" && descMap.value[4..5] == "21") {
+            log.info "${device.displayName} Xiaomi special data packet for Battery Voltage " + Integer.parseInt(mydescMap.value[8..9] + mydescMap.value[6..7], 16)
+            batteryVoltageEvent(Integer.parseInt(mydescMap.value[8..9] + mydescMap.value[6..7], 16))
+            return [:]
+        } else if (descMap.cluster == "0000" && descMap.attrId == "FF01" && descMap.value[10..13] == "0328") {
+            log.info "${device.displayName} Xiaomi special data packet for Internal Temperature " + descMap.value[14..15]
+            return [:]
+        } else {
+            log.error "${device.displayName} unknown cluster and attribute ${descMap} with data size ${descMap.value.size()}"
+        }
+    } else if (description?.startsWith("catchall")) {
+        if (descMap.clusterId == "0001" && descMap.command == 07) {
+            if (descMap.data[0] == "00") {
+                log.info "${device.displayName} cluster ${descMap.cluster} successful configure reporting response for battery percentage"
+            } else if (descMap.data[0] == "86") {
+                log.error "${device.displayName} cluster ${descMap.cluster} UNSUPPORTED_ATTRIBUTE passed to configure battery percentage"
+            } else if (descMap.data[0] == "8D") {
+                log.error "${device.displayName} cluster ${descMap.cluster} INVALID_DATA_TYPE passed to configure battery percentage"
+            }
+        } else if (descMap.clusterId == "0006" && descMap.command == 07) {
+            log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for ?"
+        } else if (descMap.clusterId == "0013") {
+            log.info "${device.displayName} cluster ${descMap.clusterId} device announce? ${descMap.data}"
+        } else if (descMap.clusterId == "0402" && descMap.command == 07) {
+            log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for temperature"
+        } else if (descMap.clusterId == "0405" && descMap.command == 07) {
+            log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for humidity"
+        } else if (descMap.clusterId == "8021" && descMap.command == 07) {
+            log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for ?"
+        }
+        log.warn "${device.displayName} unsupported catchall ${descMap}"
+    } else {
+        log.error "${device.displayName} unsupported description ${description}"
+    }
+    return [:]
 }
 
 void installed() {
 	log.debug "${device.displayName} installed() called"
+    presenceDetect = true
+    presenceHours = 12
+    temperatureOffset = 0
+    humidityOffset = 0
 }
 
 void uninstalled() {
@@ -108,47 +143,62 @@ void updated() {
 def refresh() {
 	log.debug "${device.displayName} refresh() requested"
 
-    List<String> cmd = []
+    List<String> cmds = []
 
-	cmd += zigbee.onOffRefresh()
+	cmds += zigbee.readAttribute(0x0000, 0x0005)    // Device ID
+	cmds += zigbee.readAttribute(0x0001, 0x0020)    // Battery Voltage
+	cmds += zigbee.readAttribute(0x0001, 0x0021)    // Battery % remaining
+	cmds += zigbee.readAttribute(0x0402, 0x0000)    // Temperature
+    cmds += zigbee.readAttribute(0x0405, 0x0000)    // Humidity
 
-	cmd += zigbee.readAttribute(0x0001, 0x0020)    // Battery Voltage
-	cmd += zigbee.readAttribute(0x0001, 0x0021)    // Battery % remaining
-	cmd += zigbee.readAttribute(0x0402, 0x0000)    // Temperature
-	cmd += zigbee.readAttribute(0x0405, 0x0000)    // Humidity
-
-    log.info "${device.displayName} refresh() sending commands ${cmd}"
-
-	return cmd
+    return cmds
 }
 
 def configure() {
 	log.debug "${device.displayName} configure() requested"
 
-    Integer zDelay = 100
-	List<String> cmd = []
+	List<String> cmds = []
 
 	unschedule()
 	state.clear()
 
 	if (presenceDetect != false) presenceStart()
 
-	cmd = []
-
-    cmd += zigbee.onOffConfig()          // Predefined configureReporting for OnOff (0x0006, 0x0000)
-    cmd += zigbee.batteryConfig()        // Predefined configureReporting for batteries (0x0001, 0x0020)
-    cmd += zigbee.temperatureConfig()    // Predefined configureReporting for temperature (0x0402, 0x0000)
-    
     //List configureReporting(Integer clusterId, Integer attributeId, Integer dataType, Integer minReportTime, Integer maxReportTime, Integer reportableChange = null, Map additionalParams=[:], int delay = STANDARD_DELAY_INT)
-	cmd += zigbee.configureReporting(0x0001, 0x0021, 0x20, 30, 21600, 1)   // Configure Battery %
-	cmd += zigbee.configureReporting(0x0405, 0x0000, 0x20, 30, 3600, 1)    // Configure Humidity
+	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 300, 21600, 0x01)   // Configure Battery Voltage - Report at least once per 6hrs or every 5 mins if a change of 100mV detected
+	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 900, 3600, 0x10)    // Configure temperature - Report at least once per hour or every 15 mins if a change of 0.1C detected
+	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 300, 21600, 0x01)   // Configure Battery % - Report at least once per 6hrs or every 5 mins if a change of 1% detected
+	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 600, 3600, 0x01)   // Configure Humidity - Report at least once per hour or every 10 mins if a change of 0.1% detected
 
-    log.info "${device.displayName} configure() sending commands ${cmd}"
-
-	return cmd
+	sendZigbeeCommands(cmds)    // Send directly instead of relying on return.  Not sure any better
+    return [:]
 }
 
 // Internal Functions
+
+void sendZigbeeCommands(List<String> cmds) {
+	log.debug "${device.displayName} sendZigbeeCommands received : ${cmds}"
+	sendHubCommand(new hubitat.device.HubMultiAction(cmds, hubitat.device.Protocol.ZIGBEE))
+}
+
+void sendZigbeeCommands(List<String> cmds, Long delay) {
+    sendZigbeeCommands(delayBetween(cmds, delay))
+}
+
+void resetToDefaults() {
+    sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0001 0x0020 0x20 0xFFFF 0x0000 {0000}"], 500)
+    sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0001 0x0021 0x20 0xFFFF 0x0000 {0000}"], 500)
+    sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0402 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0402 0x0000 0x29 0xFFFF 0x0000 {0000}"], 500)
+    sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0405 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0405 0x0000 0x21 0xFFFF 0x0000 {0000}"], 500)
+}
+
+// Testing Code
+void codeTest() {
+    //log.info "${device.displayName}  My temperature config output    " + zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 900, 3600, 0x0100)
+	//sendZigbeeCommands(zigbee.temperatureConfig(900, 3600))   // Configure temperature - Report at least once per hour or every 15 mins if a change of ?C detected
+    sendZigbeeCommands(zigbee.readAttribute(0x0000, 0x0004))
+    sendZigbeeCommands(zigbee.readAttribute(0x0000, 0x0005))
+}
 
 def presenceStart() {
 	if (presenceHours == null) presenceHours = "12"
@@ -170,15 +220,14 @@ def temperatureEvent(rawValue) {
     // A Value of 0x8000 indicates that the temperature measurement is invalid
     
     if (rawValue != 32768) {
-        Float temp = rawValue / 100
-        Float offset = temperatureOffset ? temperatureOffset : 0
+        BigDecimal offset = temperatureOffset ? new BigDecimal(temperatureOffset).setScale(2, BigDecimal.ROUND_HALF_UP) : 0
+        BigDecimal temp = new BigDecimal(rawValue).setScale(2, BigDecimal.ROUND_HALF_UP) / 100
 
         // Apply offset and convert to F if location scale set to F
         temp = (location.temperatureScale == "F") ? ((temp * 1.8) + 32) + offset : temp + offset
-        temp = temp.round(1)
     
     	sendEvent("name": "temperature", "value": temp, "unit": "\u00B0" + location.temperatureScale)
-        log.debug "${device.displayName} temperature changed to ${temp}\u00B0 ${location.temperatureScale}"
+        log.info "${device.displayName} temperature changed to ${temp}\u00B0 ${location.temperatureScale}"
     } else {
         log.error "${device.displayName} temperature read failed"
     }
@@ -191,21 +240,35 @@ def humidityEvent(rawValue) {
     // A value of 0xffff indicates that the measurement is invalid.
     
     if (rawValue != 65535 && rawValue <= 10000) {
-        Float humidity = rawValue / 100
+        BigDecimal offset = humidityOffset ? new BigDecimal(humidityOffset).setScale(2, BigDecimal.ROUND_HALF_UP) : 0
+        BigDecimal humidity = new BigDecimal(rawValue).setScale(2, BigDecimal.ROUND_HALF_UP) / 100 + offset
 	    sendEvent("name": "humidity", "value": humidity, "unit": "%")
-        log.debug "${device.displayName} humidity changed to ${humidity}%"
+        log.info "${device.displayName} humidity changed to ${humidity}%"
     } else {
         log.error "${device.displayName} humidity read failed"
     }
 }
 
+def pressureEvent(rawValue) {
+    // Value represents the pressure in kPa as follows: 
+    // Value = 10 x Pressure where -3276.7 kPa <= Pressure <= 3276.7 kPa, corresponding to a value in the range 0x8001 to 0x7fff.
+    // A Valueof 0x8000 indicates that the pressure measurement is invalid.
+    if (rawValue != 32768) {
+        Integer pressure = rawValue    // Divide by 10 for kPa or leave for hPa
+        sendEvent("name": "pressure", "value": pressure, "unit": "hPa")
+        log.info "${device.displayName} pressure changed to ${pressure} hPa"
+    } else {
+        log.error "${device.displayName} pressure read failed"
+    }
+}
+
 def batteryVoltageEvent(rawValue) {
     // The BatteryVoltage attribute is 8 bits in length and specifies the current actual (measured) battery voltage, in units of 100mV
-	def batteryVolts = (rawValue / 10).setScale(2, BigDecimal.ROUND_HALF_UP)
+	BigDecimal batteryVolts = new BigDecimal(rawValue).setScale(2, BigDecimal.ROUND_HALF_UP) / 10
 
-    if (batteryValue > 0){
+    if (batteryVolts > 0){
 		sendEvent("name": "voltage", "value": batteryVolts, "unit": "volts")
-        log.debug "${device.displayName} voltage changed to ${batteryVolts}V"
+        log.info "${device.displayName} voltage changed to ${batteryVolts}V"
 	}
     
     if (device.currentValue("battery") == null) {
@@ -215,7 +278,7 @@ def batteryVoltageEvent(rawValue) {
 	    def pct = (((rawValue - minVolts) / (maxVolts - minVolts)) * 100).toInteger()
 	    def batteryValue = Math.min(100, pct)
     	sendEvent("name": "battery", "value": batteryValue, "unit": "%")
-        log.debug "${device.displayName} battery % remaining changed to ${batteryValue}%"
+        log.info "${device.displayName} battery % remaining changed to ${batteryValue}%"
     }
 }
 
@@ -228,7 +291,7 @@ def batteryPercentageEvent(rawValue) {
         def batteryValue = Math.min(100, pct)
     
     	sendEvent("name": "battery", "value": batteryValue, "unit": "%")
-        log.debug "${device.displayName} battery % remaining changed to ${batteryValue}%"
+        log.info "${device.displayName} battery % remaining changed to ${batteryValue}%"
     } else {
         log.error "${device.displayName} battery % remaining read failed"
     }
@@ -236,10 +299,10 @@ def batteryPercentageEvent(rawValue) {
 
 def present() {
 	sendEvent("name": "presence", "value":  "present", isStateChange: true)
-    log.debug "${device.displayName} contact changed to present"
+    log.info "${device.displayName} contact changed to present"
 }
 
 def notPresent() {
 	sendEvent("name": "presence", "value":  "not present", isStateChange: true)
-    log.debug "${device.displayName} contact changed to not present"
+    log.info "${device.displayName} contact changed to not present"
 }
