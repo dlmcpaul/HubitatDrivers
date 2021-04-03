@@ -1,6 +1,6 @@
 /**
  *  T&E ZigBee Temperature Humidity Sensor
- *  Version 1.0
+ *  Version 1.1
  *
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -18,7 +18,14 @@
  * TODO
  * - Configuration and timings of reporting needs work
  * - Understand and implement handling of catchall events
+ * 
  */
+
+/* Some notes on sleepy devices
+ * - Sleepy devices only seem to accept commands on initialisation (usually from joining) or when sending a report (and then only 1 command maybe)
+ * - So to do anything outside the above constraints means waiting for the device to report in and then sending the request.
+ * - Does Hubitat handle that or does the driver?
+*/
 
 metadata {
 	definition (name: "T&E Temp Humidity Sensor", namespace: "hzindustries", author: "David McPaul") {
@@ -30,37 +37,36 @@ metadata {
 		capability "Refresh"
 		
 		attribute "voltage", "number"
+		attribute "queuedCommand", "string"
 
-		command "codeTest"
+		command "reconfigure"
+		command "refreshAll"
 		command "resetToDefaults"
 		
 		// Home Automation Profile = 0104
 		fingerprint profileId: "0104", deviceId: "", inClusters:"0000,0001,0003,0402,0405", outClusters:"0003,0402,0405", manufacturer:"TUYATEC-Bfq2i2Sy", model:"RH3052", deviceJoinName: "T&H Zigbee Temp Humidity Sensor"
 	}
 	preferences {
-		input name: "presenceDetect", type: "bool", title: "Enable Presence Detection", description: "This will keep track of when the device last reported and will change state if no data received within the Presence Timeout. If it does lose presence try pushing the reset button on the device if available.", defaultValue: true
-		input name: "presenceHours", type: "enum", title: "Presence Timeout", description: "The number of hours before a device is considered 'not present'.<br>Note: Some of these devices only update their battery every 6 hours.", defaultValue: "12", options: ["1","2","3","4","6","12","24"]
+		input name: "checkHealth", type: "bool", title: "Enable Health Check", description: "Track the health of the device by tracking when the device reports and if no report within the time defined report as not present.  Devices that fail to report will need to be rediscoverd", defaultValue: true
+		input name: "healthTimeout", type: "enum", title: "Health Timeout", description: "The number of hours before a device is considered 'not present'.", defaultValue: "12", options: ["1","2","3","4","6","12","24"]
 		input name: "temperatureOffset", type: "number", title: "Temperature Offset", description: "This setting compensates for an inaccurate temperature sensor. For example, set to -7 if the temperature is 7 degress too warm.", defaultValue: "0"
 		input name: "humidityOffset", type: "number", title: "Humidity Offset", description: "This setting compensates for an inaccurate humidity sensor. For example, set to -7 if the humidity is 7% too high.", defaultValue: "0"
 	}
 }
 
-// Callacks
+// Callbacks
 
 def parse(String description) {
 
-	if (presenceDetect != false) {    // Null or True
-		unschedule(presenceTracker)
-		if (device.currentValue("presence") != "present") {
-			present()
-		}
-		presenceStart()
-	}
+	deviceReported()
+	
 	def descMap = zigbee.parseDescriptionAsMap(description)
+	def label = "Unknown"
+	
 	if (descMap.cluster != null || descMap.clusterId != null) {
 		def lookup = descMap.cluster != null ? descMap.cluster : descMap.clusterId
 		def cluster = zigbee.clusterLookup(lookup)
-		log.debug "${device.displayName} cluster ${cluster.clusterLabel} from message ${lookup}"
+		label = cluster == null ? "Lookup failed for cluster ${lookup}" : cluster.clusterLabel == null ? "Unknown" : cluster.clusterLabel
 	}
 	
 	if (description?.startsWith("read attr")) {
@@ -70,111 +76,105 @@ def parse(String description) {
 			log.info "${device.displayName} Manufacturer Name ${descMap.value}"
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0005") {
 			log.info "${device.displayName} Model ID ${descMap.value}"
+		} else if (descMap.cluster == "0000" && descMap.attrId == "0006") {
+			log.info "${device.displayName} Date Code ${descMap.value}"
 		} else if (descMap.cluster == "0001" && descMap.attrId == "0020") {
 			batteryVoltageEvent(Integer.parseInt(descMap.value, 16))
-			return [:]
 		} else if (descMap.cluster == "0001" && descMap.attrId == "0021") {
 			batteryPercentageEvent(Integer.parseInt(descMap.value, 16))
-			return [:]
 		} else if (descMap.cluster == "0402" && descMap.attrId == "0000") {
 			temperatureEvent(hexStrToSignedInt(descMap.value))
-			return [:]
 		} else if (descMap.cluster == "0403" && descMap.attrId == "0000") {
 			pressureEvent(Integer.parseInt(descMap.value, 16))
-			return [:]
 		} else if (descMap.cluster == "0405" && descMap.attrId == "0000") {
 			humidityEvent(Integer.parseInt(descMap.value, 16))
-			return [:]
-		} else if (descMap.cluster == "0000" && descMap.attrId == "FF01" && descMap.value[4..5] == "21") {
-			log.info "${device.displayName} Xiaomi special data packet for Battery Voltage " + Integer.parseInt(mydescMap.value[8..9] + mydescMap.value[6..7], 16)
-			batteryVoltageEvent(Integer.parseInt(mydescMap.value[8..9] + mydescMap.value[6..7], 16))
-			return [:]
-		} else if (descMap.cluster == "0000" && descMap.attrId == "FF01" && descMap.value[10..13] == "0328") {
-			log.info "${device.displayName} Xiaomi special data packet for Internal Temperature " + descMap.value[14..15]
-			return [:]
 		} else {
 			log.error "${device.displayName} unknown cluster and attribute ${descMap} with data size ${descMap.value.size()}"
 		}
 	} else if (description?.startsWith("catchall")) {
-		if (descMap.clusterId == "0001" && descMap.command == 07) {
-			if (descMap.data[0] == "00") {
-				log.info "${device.displayName} cluster ${descMap.cluster} successful configure reporting response for battery percentage"
-			} else if (descMap.data[0] == "86") {
-				log.error "${device.displayName} cluster ${descMap.cluster} UNSUPPORTED_ATTRIBUTE passed to configure battery percentage"
-			} else if (descMap.data[0] == "8D") {
-				log.error "${device.displayName} cluster ${descMap.cluster} INVALID_DATA_TYPE passed to configure battery percentage"
-			}
-		} else if (descMap.clusterId == "0006" && descMap.command == 07) {
-			log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for ?"
+		if (descMap.clusterId == "0001" && descMap.command == "07") {    // How to differentiate configure responses here
+			logConfigureResponse(descMap.clusterId, "battery percentage or voltage", descMap.data[0])
+		} else if (descMap.clusterId == "0006" && descMap.command == "07") {
+			logConfigureResponse(descMap.clusterId, descMap.attrId, descMap.data[0])
 		} else if (descMap.clusterId == "0013") {
 			log.info "${device.displayName} cluster ${descMap.clusterId} device announce? ${descMap.data}"
-		} else if (descMap.clusterId == "0402" && descMap.command == 07) {
-			log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for temperature"
-		} else if (descMap.clusterId == "0405" && descMap.command == 07) {
-			log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for humidity"
-		} else if (descMap.clusterId == "8021" && descMap.command == 07) {
-			log.info "${device.displayName} cluster ${descMap.clusterId} configure reporting response for ?"
+		} else if (descMap.clusterId == "0402" && descMap.command == "07") {
+			logConfigureResponse(descMap.clusterId, "temperature", descMap.data[0])
+		} else if (descMap.clusterId == "0405" && descMap.command == "07") {
+			logConfigureResponse(descMap.clusterId, "humidity", descMap.data[0])
+		} else if (descMap.clusterId == "8021" && descMap.command == "07") {
+			logConfigureResponse(descMap.clusterId, descMap.attrId, descMap.data[0])
+		} else {
+			log.warn "${device.displayName} unsupported catchall with map ${descMap}"
 		}
-		log.warn "${device.displayName} unsupported catchall ${descMap}"
 	} else {
-		log.error "${device.displayName} unsupported description ${description}"
+		log.error "${device.displayName} unsupported description ${description} with map ${descMap}"
 	}
+
 	return [:]
 }
 
 void installed() {
 	log.debug "${device.displayName} installed() called"
-	presenceDetect = true
-	presenceHours = 12
-	temperatureOffset = 0
-	humidityOffset = 0
+	device.updateSetting("checkHealth",[value:"true",type:"bool"])
+	device.updateSetting("healthTimeout",[value:"12",type:"enum"])
+	device.updateSetting("temperatureOffset",[value:"0",type:"number"])
+	device.updateSetting("humidityOffset",[value:"0",type:"number"])
+	state.queuedCommand = "none"
 }
 
 void uninstalled() {
 	log.debug "${device.displayName} uninstalled() called"
+	unschedule()
 }
 
 void updated() {
 	log.debug "${device.displayName} updated() called"
-	unschedule(presenceTracker)
-	if (presenceDetect != false) presenceStart()
+	unschedule(reportHealthCheckFail)
+	if (checkHealth != false) startHealthCheck()
 }
 
 def refresh() {
 	log.debug "${device.displayName} refresh() requested"
 
-	List<String> cmds = []
-
-	cmds += zigbee.readAttribute(0x0000, 0x0005)    // Device ID
-	cmds += zigbee.readAttribute(0x0001, 0x0020)    // Battery Voltage
-	cmds += zigbee.readAttribute(0x0001, 0x0021)    // Battery % remaining
-	cmds += zigbee.readAttribute(0x0402, 0x0000)    // Temperature
-	cmds += zigbee.readAttribute(0x0405, 0x0000)    // Humidity
-
-	return cmds
+	return getRefreshCmds()
 }
 
+
+// This only seems to work when called as part of device join.
 def configure() {
 	log.debug "${device.displayName} configure() requested"
-
-	List<String> cmds = []
 
 	unschedule()
 	state.clear()
 
-	if (presenceDetect != false) presenceStart()
+	if (checkHealth != false) startHealthCheck()
 
-	//List configureReporting(Integer clusterId, Integer attributeId, Integer dataType, Integer minReportTime, Integer maxReportTime, Integer reportableChange = null, Map additionalParams=[:], int delay = STANDARD_DELAY_INT)
-	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 300, 21600, 0x01)   // Configure Battery Voltage - Report at least once per 6hrs or every 5 mins if a change of 100mV detected
-	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 900, 3600, 0x10)    // Configure temperature - Report at least once per hour or every 15 mins if a change of 0.1C detected
-	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 300, 21600, 0x01)   // Configure Battery % - Report at least once per 6hrs or every 5 mins if a change of 1% detected
-	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 600, 3600, 0x01)   // Configure Humidity - Report at least once per hour or every 10 mins if a change of 0.1% detected
-
-	sendZigbeeCommands(cmds)    // Send directly instead of relying on return.  Not sure any better
-	return [:]
+	return getConfigureCmds()
 }
 
 // Internal Functions
+void logConfigureResponse(cluster, attribute, code) {
+	if (code == "00") {
+		log.info "${device.displayName} cluster ${cluster} successful configure reporting response for ${attribute}"
+	} else if (code == "86") {
+		log.error "${device.displayName} cluster ${cluster} UNSUPPORTED_ATTRIBUTE passed to configure ${attribute}"
+	} else if (code == "8D") {
+		log.error "${device.displayName} cluster ${cluster} INVALID_DATA_TYPE passed to configure ${attribute}"
+	}
+}
+
+void deviceReported() {
+	sendDelayedCmds()
+	
+	if (checkHealth != false) {    // Null or True
+		unschedule(reportHealthCheckFail)
+		if (device.currentValue("presence") != "present") {
+			present()
+		}
+		startHealthCheck()
+	}
+}
 
 void sendZigbeeCommands(List<String> cmds) {
 	log.debug "${device.displayName} sendZigbeeCommands received : ${cmds}"
@@ -186,29 +186,88 @@ void sendZigbeeCommands(List<String> cmds, Long delay) {
 }
 
 void resetToDefaults() {
-	sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0001 0x0020 0x20 0xFFFF 0x0000 {0000}"], 500)
-	sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0001 0x0021 0x20 0xFFFF 0x0000 {0000}"], 500)
-	sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0402 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0402 0x0000 0x29 0xFFFF 0x0000 {0000}"], 500)
-	sendZigbeeCommands(["zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0405 {${device.zigbeeId}} {}", "he cr 0x${device.deviceNetworkId} 0x01 0x0405 0x0000 0x21 0xFFFF 0x0000 {0000}"], 500)
+	state.queuedCommand = "resetToDefaults"
 }
 
-// Testing Code
-void codeTest() {
-	//log.info "${device.displayName}  My temperature config output    " + zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 900, 3600, 0x0100)
-	//sendZigbeeCommands(zigbee.temperatureConfig(900, 3600))   // Configure temperature - Report at least once per hour or every 15 mins if a change of ?C detected
-	sendZigbeeCommands(zigbee.readAttribute(0x0000, 0x0004))
-	sendZigbeeCommands(zigbee.readAttribute(0x0000, 0x0005))
+void refreshAll() {
+	state.queuedCommand = "refreshAll"
 }
 
-def presenceStart() {
-	if (presenceHours == null) presenceHours = "12"
-	def scheduleHours = presenceHours.toInteger() * 60 * 60
-	runIn(scheduleHours, "presenceTracker")
+void reconfigure() {
+	state.queuedCommand = "reconfigure"
 }
 
-def presenceTracker() {
+List<String> getRefreshCmds() {
+	List<String> cmds = []
+
+	cmds += zigbee.readAttribute(0x0000, 0x0001)    // App Version
+	cmds += zigbee.readAttribute(0x0000, 0x0004)    // Manufacturer Name
+	cmds += zigbee.readAttribute(0x0000, 0x0005)    // Model ID
+	cmds += zigbee.readAttribute(0x0000, 0x0006)    // Date Code
+	cmds += zigbee.readAttribute(0x0001, 0x0020)    // Battery Voltage
+	cmds += zigbee.readAttribute(0x0001, 0x0021)    // Battery % remaining
+	cmds += zigbee.readAttribute(0x0402, 0x0000)    // Temperature
+	cmds += zigbee.readAttribute(0x0405, 0x0000)    // Humidity
+	
+	return cmds
+}
+
+List<String> getConfigureCmds() {
+	List<String> cmds = []
+
+	//List configureReporting(Integer clusterId, Integer attributeId, Integer dataType, Integer minReportTime, Integer maxReportTime, Integer reportableChange = null, Map additionalParams=[:], int delay = STANDARD_DELAY_INT)
+	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 21600, 0x01, [:], 500)   // Configure Battery Voltage - Report at least once per 6hrs if a change of 100mV detected
+	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 21600, 0x01, [:], 500)   // Configure Battery % - Report at least once per 6hrs if a change of 1% detected
+	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 900, 3600, 0x10, [:], 500)    // Configure temperature - Report at least once per hour or every 15 mins if a change of 0.1C detected
+	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 900, 3600, 0x10, [:], 500)   // Configure Humidity - Report at least once per hour or every 15 mins if a change of 1% detected
+
+	return cmds
+}
+
+List<String> getResetToDefaultsCmds() {
+	List<String> cmds = []
+
+	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 0xFFFF, null, [:], 500)   // Reset Battery Voltage reporting to default
+	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 0xFFFF, null, [:], 500)   // Reset Battery % reporting to default
+	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 0xFFFF, null, [:], 500)    // Reset temperature reporting to default
+	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 0, 0xFFFF, null, [:], 500)   // Reset Humidity reporting to default
+
+	//cmds += "zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}"
+	//cmds += "he cr 0x${device.deviceNetworkId} 0x01 0x0001 0x0020 0x20 0xFFFF 0x0000 {0000}"
+	//cmds += "zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}"
+	//cmds += "he cr 0x${device.deviceNetworkId} 0x01 0x0001 0x0021 0x20 0xFFFF 0x0000 {0000}"
+	//cmds += "zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0402 {${device.zigbeeId}} {}"
+	//cmds += "he cr 0x${device.deviceNetworkId} 0x01 0x0402 0x0000 0x29 0xFFFF 0x0000 {0000}"
+	//cmds += "zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0405 {${device.zigbeeId}} {}"
+	//cmds += "he cr 0x${device.deviceNetworkId} 0x01 0x0405 0x0000 0x21 0xFFFF 0x0000 {0000}"
+	
+	return cmds
+}
+
+void sendDelayedCmds() {
+
+	if (state.queuedCommand != "none") {
+		log.debug "${device.displayName} sending delayed command ${state.queuedCommand}"
+	
+		if (state.queuedCommand == "resetToDefaults") {
+		    sendZigbeeCommands(getResetToDefaultsCmds())
+		} else if (state.queuedCommand == "refreshAll") {
+			sendZigbeeCommands(getRefreshCmds())
+		} else if (state.queuedCommand == "reconfigure") {
+			sendZigbeeCommands(getConfigureCmds())
+		}
+	}
+	state.queuedCommand = "none"
+}
+
+def startHealthCheck() {
+	if (healthTimeout == null) healthTimeout = "12"
+	def timeoutAsHours = healthTimeout.toInteger() * 60 * 60
+	runIn(timeoutAsHours, "reportHealthCheckFail")
+}
+
+def reportHealthCheckFail() {
 	notPresent()
-	log.warn "${device.displayName} detected as not present"
 }
 
 // Events generated
@@ -304,5 +363,5 @@ def present() {
 
 def notPresent() {
 	sendEvent("name": "presence", "value":  "not present", isStateChange: true)
-	log.info "${device.displayName} contact changed to not present"
+	log.warn "${device.displayName} contact changed to not present"
 }
