@@ -1,6 +1,6 @@
 /**
  *  T&E ZigBee Temperature Humidity Sensor
- *  Version 1.1
+ *  Version 1.2
  *
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -14,20 +14,35 @@
  *
  *
  * Based on various other drivers including Xiaomi Aqara Mijia Sensors and Switches, Nue Temp Humidity Sensor and others
+ * Uses Zigbee documentation where available
  *
  * TODO
- * - Configuration and timings of reporting needs work
+ * - Configuration and timings of reporting needs work (Each device has different defaults and seems to respond differently to configure commands)
  * - Understand and implement handling of the catchall events not yet recognised
  * - parse is multi-threaded which makes the queueing mechanism a problem and the various syncronisation options don't seem to work
  * 
  */
 
-/* Some notes on sleepy devices
- * - Sleepy devices only seem to accept commands on initialisation (usually from joining) or when sending a report (and then only 1 command maybe)
- * - So to do anything outside the above constraints means waiting for the device to report in and then sending the request.
- * - Does Hubitat handle that or does the driver?
- * - Looks like Hubitat does not hold requests for Sleepy End Devices but if a repeater is used the repeater might?
- * - So hubitat -> repeater -> child device might be the best setup?
+/* Some notes
+   - All these devices are known as Sleepy End Devices
+   - Sleepy devices only seem to accept commands on initialisation (usually from joining) or when sending a report (and then only for a limited time [how many ms?])
+   - So to do anything outside the above constraints means waiting for the device to report in and then sending the request.
+   - It looks like it is up to the driver to hold commands until a report arrives
+   - This driver has a MVP implementation that basically works but more effort is is needed around multi-threading (No idea why I cannot create a real static semaphore)
+   - Accuracy of the sensors is all over the place even within the same manufacturer
+
+This driver now handles 3 manufacturer and models.  Each one responds a little different despite being the same profile and returning the same values (temp/humidity)
+
+=====================================================
+Device     | Default Reporting | Identify Implemented
+=====================================================
+T&H        | Ok                | No
+-----------------------------------------------------
+Aqara      | Ok                | No
+-----------------------------------------------------
+Sonoff     | Too Fast          | Yes
+=====================================================
+
 */
 
 metadata {
@@ -49,6 +64,7 @@ metadata {
 		// Home Automation Profile = 0104 (clusterId 0000 = base info, clusterId 0001 = battery (perc, volt), clusterId 0003 = identify, clusterId 0402 = temperature, clusterId 0403 = pressure, clusterId 0405 = humidity)
 		fingerprint profileId: "0104", deviceId: "", inClusters: "0000,0001,0003,0402,0405", outClusters:"0003,0402,0405", manufacturer:"TUYATEC-Bfq2i2Sy", model:"RH3052", deviceJoinName: "T&H Temp Humidity Sensor"
 		fingerprint profileId: "0104", deviceId: "", inClusters: "0000,0003,FFFF,0402,0403,0405", outClusters: "0000,0004,FFFF", manufacturer: "LUMI", model: "lumi.weather", deviceJoinName: "Aqara Temp Humidity Pressure Sensor"
+		fingerprint profileId: "0104", deviceId: "", inClusters: "0000,0001,0003,0402,0405", outClusters: "0003", manufacturer: "eWeLink", model: "TH01", deviceJoinName: "Sonoff Temp Humidity Sensor"
 	}
 	preferences {
 		input name: "checkHealth", type: "bool", title: "Enable Health Check", description: "Track the health of the device by checking when the device reports and if no report occurs within the time defined then report as not present.  Devices that fail to report will likely need to be rediscovered", defaultValue: true
@@ -88,7 +104,7 @@ def parse(String description) {
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0006") {
 			log.info "${device.displayName} Date Code ${descMap.value}"
 		} else if (descMap.cluster == "0000" && descMap.attrId == "FF01" && descMap.value.size() > 20) {
-			log.debug "${device.displayName} Xiaomi data ${descMap.raw[22..27]}"
+			//log.debug "${device.displayName} Xiaomi data ${descMap.raw[22..27]}"
 			if (descMap.raw[22..23] == "21") {
 				batteryVoltageEvent(Integer.parseInt(descMap.raw[26..27] + descMap.raw[24..25], 16) / 100)
 			}
@@ -152,25 +168,27 @@ void uninstalled() {
 	unschedule()
 }
 
+// Called when preferences saved
 void updated() {
 	log.debug "${device.displayName} updated() called"
 	state.clear()
+	state.queuedCommand = "none"
 	resetHealthCheck()
 }
 
 def refresh() {
 	log.debug "${device.displayName} refresh() requested"
 	state.clear()
+	state.queuedCommand = "refreshAll"
 	return getRefreshCmds()
 }
 
 // This only seems to work when called as part of device join.
 def configure() {
 	log.debug "${device.displayName} configure() requested"
-
 	state.clear()
+	state.queuedCommand = "none"
 	resetHealthCheck()
-
 	return getConfigureCmds()
 }
 
@@ -208,8 +226,9 @@ void deviceReported() {
 		}
 	} catch (InterruptedException e) {
 		e.printStackTrace();
+	} finally {
+		mutex.release()
 	}
-	mutex.release()
 }
 
 void sendZigbeeCommands(List<String> cmds) {
@@ -246,14 +265,10 @@ void identify() {
 List<String> getRefreshCmds() {
 	List<String> cmds = []
 
-	cmds += zigbee.readAttribute(0x0000, 0x0001)	// App Version
-	cmds += zigbee.readAttribute(0x0000, 0x0004)	// Manufacturer Name
-	cmds += zigbee.readAttribute(0x0000, 0x0005)	// Model ID
-	cmds += zigbee.readAttribute(0x0000, 0x0006)	// Date Code
-	cmds += zigbee.readAttribute(0x0001, 0x0020)	// Battery Voltage
-	cmds += zigbee.readAttribute(0x0001, 0x0021)	// Battery % remaining
-	cmds += zigbee.readAttribute(0x0402, 0x0000)	// Temperature
-	cmds += zigbee.readAttribute(0x0405, 0x0000)	// Humidity
+	cmds += zigbee.readAttribute(0x0000, [0x0001, 0x0004, 0x0005, 0x0006])  // App Version, Manufacturer Name, Model ID, Date Code
+	cmds += zigbee.readAttribute(0x0001, [0x0020, 0x0021])                  // Battery Voltage & Battery % remaining
+	cmds += zigbee.readAttribute(0x0402, 0x0000)                            // Temperature
+	cmds += zigbee.readAttribute(0x0405, 0x0000)                            // Humidity
 	
 	return cmds
 }
@@ -262,8 +277,8 @@ List<String> getConfigureCmds() {
 	List<String> cmds = []
 
 	//List configureReporting(Integer clusterId, Integer attributeId, Integer dataType, Integer minReportTime, Integer maxReportTime, Integer reportableChange = null, Map additionalParams=[:], int delay = STANDARD_DELAY_INT)
-	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 3600, null, [:], 500)  // Configure temperature - Report once per hour 
-	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 0, 3600, null, [:], 500) // Configure Humidity - Report once per hour
+	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure temperature - Report once per hour 
+	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 0, 3600, 100, [:], 500) // Configure Humidity - Report once per hour
 	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery Voltage - Report once per 6hrs or if a change of 100mV detected
 	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery % - Report once per 6hrs or if a change of 1% detected
 
@@ -286,7 +301,7 @@ List<String> getResetToDefaultsCmds() {
 	//cmds += "he cr 0x${device.deviceNetworkId} 0x01 0x0402 0x0000 0x29 0xFFFF 0x0000 {0000}"
 	//cmds += "zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0405 {${device.zigbeeId}} {}"
 	//cmds += "he cr 0x${device.deviceNetworkId} 0x01 0x0405 0x0000 0x21 0xFFFF 0x0000 {0000}"
-	
+
 	return cmds
 }
 
@@ -311,13 +326,13 @@ private getIDENTIFY_CMD_QUERY() { 0x01 }
 private getIDENTIFY_CMD_TRIGGER() { 0x40 }
 
 List<String> getIdentifyCmds() {
-	
+
 	List<String> cmds = []
 	// Identify for 60 seconds
 	cmds += "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0003 ${IDENTIFY_CMD_IDENTIFY} { 0x${intTo16bitUnsignedHex(60)} }"
 	// Trigger Effect
 	//cmds += "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0003 ${IDENTIFY_CMD_TRIGGER} { 0x${intTo8bitUnsignedHex(EFFECT_BREATHE)} 0x${intTo8bitUnsignedHex(0)} }"
-	
+
 	return cmds;
 }
 
@@ -365,7 +380,7 @@ def temperatureEvent(rawValue) {
 		temp = (location.temperatureScale == "F") ? ((temp * 1.8) + 32) + offset : temp + offset
 	
 		sendEvent("name": "temperature", "value": temp, "unit": "\u00B0" + location.temperatureScale)
-		log.info "${device.displayName} temperature changed to ${temp}\u00B0 ${location.temperatureScale}"
+		log.info "${device.displayName} temperature changed to ${temp}\u00B0 ${location.temperatureScale} calculated from raw value ${rawValue} and offset ${offset}"
 	} else {
 		log.error "${device.displayName} temperature read failed"
 	}
@@ -381,7 +396,7 @@ def humidityEvent(rawValue) {
 		BigDecimal offset = humidityOffset ? new BigDecimal(humidityOffset).setScale(2, BigDecimal.ROUND_HALF_UP) : 0
 		BigDecimal humidity = new BigDecimal(rawValue).setScale(2, BigDecimal.ROUND_HALF_UP) / 100 + offset
 		sendEvent("name": "humidity", "value": humidity, "unit": "%")
-		log.info "${device.displayName} humidity changed to ${humidity}%"
+		log.info "${device.displayName} humidity changed to ${humidity}% calculated from raw value ${rawValue} and offset ${offset}"
 	} else {
 		log.error "${device.displayName} humidity read failed"
 	}
