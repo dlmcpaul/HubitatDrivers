@@ -1,6 +1,5 @@
 /**
  *  T&E ZigBee Temperature Humidity Sensor
- *  Version 1.2
  *
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -74,7 +73,9 @@ metadata {
 	}
 }
 
-// Mutex to allow for single threading
+public static String version()	  {  return "v1.2.0"  }
+
+// Mutex to allow for single threading but does not work
 import groovy.transform.Field
 @Field static java.util.concurrent.Semaphore mutex = new java.util.concurrent.Semaphore(1)
 
@@ -122,26 +123,38 @@ def parse(String description) {
 			log.error "${device.displayName} unknown cluster and attribute ${descMap} with data size ${descMap.value.size()}"
 		}
 	} else if (description?.startsWith("catchall")) {
-		if (descMap.clusterId == "0001" && descMap.command == "07") {	// How to differentiate configure responses here
-			logConfigureResponse(descMap.clusterId, "battery percentage or voltage", descMap.data[0])
-		} else if (descMap.clusterId == "0003" && descMap.command == "0B") {
-			if (descMap.data[0] == "00") {
-				log.info "${device.displayName} Identify Successfull ${descMap.data}"
-			} else if (descMap.data[0] == "40") {
-				log.info "${device.displayName} Trigger Effect Successfull ${descMap.data}"
-			} else {
-				log.info "${device.displayName} Unknown Response from Identify cluster ${descMap.data}"
-			}
-		} else if (descMap.clusterId == "0006" && descMap.command == "07") {
-			logConfigureResponse(descMap.clusterId, "", descMap.data[0])
-		} else if (descMap.clusterId == "0013") {
+		if (descMap.clusterId == "0013") {
 			log.info "${device.displayName} cluster ${descMap.clusterId} device announce? ${descMap.data}"
-		} else if (descMap.clusterId == "0402" && descMap.command == "07") {
-			logConfigureResponse(descMap.clusterId, "temperature", descMap.data[0])
-		} else if (descMap.clusterId == "0405" && descMap.command == "07") {
-			logConfigureResponse(descMap.clusterId, "humidity", descMap.data[0])
-		} else if (descMap.clusterId == "8021" && descMap.command == "00") {
-			log.info "${device.displayName} Bind Successfull with sequence ${descMap.data[0]}"
+		} else if (descMap.clusterId == "8021") {
+			log.info "${device.displayName} Bind Successfull with sequence ${descMap.data[0]} and command ${descMap.command}"
+		} else if (descMap.command == "07") {  // Configuration responses
+			if (descMap.clusterId == "0001") {
+				logConfigureResponse(descMap.clusterId, "battery percentage or voltage", descMap.data[0])  // How to differentiate configure responses here for cluster 0001
+			} else if (descMap.clusterId == "0006") {
+				logConfigureResponse(descMap.clusterId, "", descMap.data[0])
+			} else if (descMap.clusterId == "0402") {
+				log.info "${device.displayName} Temperature configuration Successfull ${descMap.data}"
+			} else if (descMap.clusterId == "0403") {
+				log.info "${device.displayName} Pressure configuration Successfull ${descMap.data}"
+			} else if (descMap.clusterId == "0405") {
+				log.info "${device.displayName} Humidity configuration Successfull ${descMap.data}"
+			}
+		} else if (descMap.command == "0B") {  // Default responses
+			if (descMap.clusterId == "0003") {
+				if (descMap.data[0] == "00") {
+					log.info "${device.displayName} Identify Successfull ${descMap.data}"
+				} else if (descMap.data[0] == "40") {
+					log.info "${device.displayName} Trigger Effect Successfull ${descMap.data}"
+				} else {
+					log.info "${device.displayName} Unknown Response from Identify cluster ${descMap.data}"
+				}
+			} else if (descMap.clusterId == "0402") {
+				log.info "${device.displayName} Temperature configuration Successfull ${descMap.data}"
+			} else if (descMap.clusterId == "0403") {
+				log.info "${device.displayName} Pressure configuration Successfull ${descMap.data}"
+			} else if (descMap.clusterId == "0405") {
+				log.info "${device.displayName} Humidity configuration Successfull ${descMap.data}"
+			}
 		} else {
 			log.warn "${device.displayName} unsupported catchall with map ${descMap}"
 		}
@@ -153,7 +166,7 @@ def parse(String description) {
 }
 
 void installed() {
-	log.debug "${device.displayName} installed() called"
+	log.info "${device.displayName} installed() called"
 	device.updateSetting("checkHealth",[value:"true",type:"bool"])
 	device.updateSetting("healthTimeout",[value:"12",type:"enum"])
 	device.updateSetting("temperatureOffset",[value:"0",type:"number"])
@@ -163,21 +176,21 @@ void installed() {
 }
 
 void uninstalled() {
-	log.debug "${device.displayName} uninstalled() called"
+	log.info "${device.displayName} uninstalled() called"
 	state.clear()
 	unschedule()
 }
 
 // Called when preferences saved
 void updated() {
-	log.debug "${device.displayName} updated() called"
+	log.info "${device.displayName} updated() called"
 	state.clear()
 	state.queuedCommand = "none"
 	resetHealthCheck()
 }
 
 def refresh() {
-	log.debug "${device.displayName} refresh() requested"
+	log.info "${device.displayName} refresh() requested"
 	state.clear()
 	state.queuedCommand = "refreshAll"
 	return getRefreshCmds()
@@ -185,7 +198,7 @@ def refresh() {
 
 // This only seems to work when called as part of device join.
 def configure() {
-	log.debug "${device.displayName} configure() requested"
+	log.info "${device.displayName} configure() requested"
 	state.clear()
 	state.queuedCommand = "none"
 	resetHealthCheck()
@@ -268,6 +281,7 @@ List<String> getRefreshCmds() {
 	cmds += zigbee.readAttribute(0x0000, [0x0001, 0x0004, 0x0005, 0x0006])  // App Version, Manufacturer Name, Model ID, Date Code
 	cmds += zigbee.readAttribute(0x0001, [0x0020, 0x0021])                  // Battery Voltage & Battery % remaining
 	cmds += zigbee.readAttribute(0x0402, 0x0000)                            // Temperature
+	cmds += zigbee.readAttribute(0x0403, 0x0000)                            // Pressure
 	cmds += zigbee.readAttribute(0x0405, 0x0000)                            // Humidity
 	
 	return cmds
@@ -278,7 +292,8 @@ List<String> getConfigureCmds() {
 
 	//List configureReporting(Integer clusterId, Integer attributeId, Integer dataType, Integer minReportTime, Integer maxReportTime, Integer reportableChange = null, Map additionalParams=[:], int delay = STANDARD_DELAY_INT)
 	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure temperature - Report once per hour 
-	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 0, 3600, 100, [:], 500) // Configure Humidity - Report once per hour
+	cmds += zigbee.configureReporting(0x0403, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure Pressure - Report once per hour
+	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure Humidity - Report once per hour
 	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery Voltage - Report once per 6hrs or if a change of 100mV detected
 	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery % - Report once per 6hrs or if a change of 1% detected
 
@@ -288,9 +303,10 @@ List<String> getConfigureCmds() {
 List<String> getResetToDefaultsCmds() {
 	List<String> cmds = []
 
-	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 0xFFFF, null, [:], 500)   // Reset Battery Voltage reporting to default
-	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 0xFFFF, null, [:], 500)   // Reset Battery % reporting to default
-	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 0xFFFF, null, [:], 500)	// Reset temperature reporting to default (looks to be 1/2 hr reporting)
+	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery Voltage reporting to default
+	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery % reporting to default
+	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 0xFFFF, null, [:], 500)	// Reset Temperature reporting to default (looks to be 1/2 hr reporting)
+	cmds += zigbee.configureReporting(0x0403, 0x0000, DataType.INT16, 0, 0xFFFF, null, [:], 500)	// Reset Pressure reporting to default (looks to be 1/2 hr reporting)
 	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 0, 0xFFFF, null, [:], 500)   // Reset Humidity reporting to default (looks to be 1/2 hr reporting)
 
 	//cmds += "zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0001 {${device.zigbeeId}} {}"
@@ -409,7 +425,7 @@ def pressureEvent(rawValue) {
 	if (rawValue != 32768) {
 		Integer pressure = rawValue	// Divide by 10 for kPa or leave for hPa
 		sendEvent("name": "pressure", "value": pressure, "unit": "hPa")
-		log.info "${device.displayName} pressure changed to ${pressure} hPa"
+		log.info "${device.displayName} pressure changed to ${pressure} hPa calculated from raw value ${rawValue}"
 	} else {
 		log.error "${device.displayName} pressure read failed"
 	}
@@ -421,17 +437,38 @@ def batteryVoltageEvent(rawValue) {
 
 	if (batteryVolts > 0){
 		sendEvent("name": "voltage", "value": batteryVolts, "unit": "volts")
-		log.info "${device.displayName} voltage changed to ${batteryVolts}V"
+		log.info "${device.displayName} voltage changed to ${batteryVolts}V calculated from raw value ${rawValue}"
 	}
 	
-	if (device.currentValue("battery") == null) {
+	if (getDataValue("calcBattery") == null || getDataValue("calcBattery") == "true") {
+		updateDataValue("calcBattery", "true")	// We will calculate until a battery perc event occurs
 		// Guess at percentage remaining
-		def minVolts = 20
-		def maxVolts = 30
-		def pct = (((rawValue - minVolts) / (maxVolts - minVolts)) * 100).toInteger()
-		def batteryValue = Math.min(100, pct)
+		// Battery percantage is not a linear relationship to voltage
+		// Should try to do this as a table with more ranges
+		def batteryValue = 100.0
+		if (rawValue < 20.01) {
+			batteryValue = 0.0
+		} else if (rawValue < 24.01) {
+			batteryValue = 10.0
+		} else if (rawValue < 25.01) {
+			batteryValue = 20.0
+		} else if (rawValue < 26.01) {
+			batteryValue = 30.0
+		} else if (rawValue < 27.01) {
+			batteryValue = 40.0
+		} else if (rawValue < 27.51) {
+			batteryValue = 50.0
+		} else if (rawValue < 28.01) {
+			batteryValue = 60.0
+		} else if (rawValue < 28.51) {
+			batteryValue = 70.0
+		} else if (rawValue < 29.01) {
+			batteryValue = 80.0
+		} else if (rawValue < 29.51) {
+			batteryValue = 90.0
+		}
 		sendEvent("name": "battery", "value": batteryValue, "unit": "%")
-		log.info "${device.displayName} battery % remaining changed to ${batteryValue}%"
+		log.info "${device.displayName} battery % remaining changed to ${batteryValue}% calculated from voltage ${batteryVolts}"
 	}
 }
 
@@ -439,12 +476,13 @@ def batteryPercentageEvent(rawValue) {
 	// The BatteryPercentageRemaining attribute specifies the remaining battery life as a half integer percentage of the full battery capacity
 	// (e.g., 34.5%, 45%, 68.5%, 90%) with a range between zero and 100%, with 0x00 = 0%, 0x64 = 50%, and 0xC8 = 100%
 	// A value of 0xff indicates that the measurement is invalid.
+	updateDataValue("calcBattery", "false")	// Battery events are generated so no need to calc
 	if (rawValue != 255) {
 		Float pct = rawValue / 2
 		def batteryValue = Math.min(100, pct)
 	
 		sendEvent("name": "battery", "value": batteryValue, "unit": "%")
-		log.info "${device.displayName} battery % remaining changed to ${batteryValue}%"
+		log.info "${device.displayName} battery % remaining changed to ${batteryValue}% calculated from raw value ${rawValue}"
 	} else {
 		log.error "${device.displayName} battery % remaining read failed"
 	}
