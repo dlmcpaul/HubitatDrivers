@@ -27,20 +27,19 @@
    - Sleepy devices only seem to accept commands on initialisation (usually from joining) or when sending a report (and then only for a limited time [how many ms?])
    - So to do anything outside the above constraints means waiting for the device to report in and then sending the request.
    - It looks like it is up to the driver to hold commands until a report arrives
-   - This driver has a MVP implementation that basically works but more effort is is needed around multi-threading (No idea why I cannot create a real static semaphore)
    - Accuracy of the sensors is all over the place even within the same manufacturer
 
 This driver now handles 3 manufacturer and models.  Each one responds a little different despite being the same profile and returning the same values (temp/humidity)
 
-=====================================================
-Device     | Default Reporting | Identify Implemented
-=====================================================
-T&H        | Ok                | No
------------------------------------------------------
-Aqara      | Ok                | No
------------------------------------------------------
-Sonoff     | Too Fast          | Yes
-=====================================================
+=================================================================================
+Device     | Default Reporting | Identify Implemented | Cluster 0000 Reporting
+=================================================================================
+T&H        | Ok                | No                   | Yes
+---------------------------------------------------------------------------------
+Aqara      | Ok                | No                   | No
+---------------------------------------------------------------------------------
+Sonoff     | Too Fast          | Yes                  | Only Reports App Version
+=================================================================================
 
 */
 
@@ -48,6 +47,7 @@ metadata {
 	definition (name: "T&E Temp Humidity Sensor", namespace: "hzindustries", author: "David McPaul") {
 		capability "TemperatureMeasurement"
 		capability "RelativeHumidityMeasurement"
+		capability "PressureMeasurement"
 		capability "Battery"
 		capability "PresenceSensor"
 		capability "Configuration"
@@ -75,9 +75,12 @@ metadata {
 
 public static String version()	  {  return "v1.2.0"  }
 
-// Mutex to allow for single threading but does not work
 import groovy.transform.Field
+import java.util.concurrent.*
+
+// Field annotation makes these variables global to the class
 @Field static java.util.concurrent.Semaphore mutex = new java.util.concurrent.Semaphore(1)
+@Field static def queueMap = [:]
 
 // Callbacks
 
@@ -95,17 +98,22 @@ def parse(String description) {
 		label = cluster == null ? "Lookup failed for cluster ${lookup}" : cluster.clusterLabel == null ? "Unknown" : cluster.clusterLabel
 	}
 	
+	//log.info "${device.displayName} ${device.getDataValue("manufacturer")} ${device.getDataValue("model")}"
+	
 	if (description?.startsWith("read attr")) {
 		if (descMap.cluster == "0000" && descMap.attrId == "0001") {
 			log.info "${device.displayName} Application Version ${descMap.value}"
+			state.version = descMap.value
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0004") {
 			log.info "${device.displayName} Manufacturer Name ${descMap.value}"
+			state.manufacturerName = descMap.value
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0005") {
 			log.info "${device.displayName} Model ID ${descMap.value}"
+			state.modelId = descMap.value
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0006") {
 			log.info "${device.displayName} Date Code ${descMap.value}"
 		} else if (descMap.cluster == "0000" && descMap.attrId == "FF01" && descMap.value.size() > 20) {
-			//log.debug "${device.displayName} Xiaomi data ${descMap.raw[22..27]}"
+			log.debug "${device.displayName} Xiaomi data ${descMap.raw[22..27]}"
 			if (descMap.raw[22..23] == "21") {
 				batteryVoltageEvent(Integer.parseInt(descMap.raw[26..27] + descMap.raw[24..25], 16) / 100)
 			}
@@ -127,6 +135,10 @@ def parse(String description) {
 			log.info "${device.displayName} cluster ${descMap.clusterId} device announce? ${descMap.data}"
 		} else if (descMap.clusterId == "8021") {
 			log.info "${device.displayName} Bind Successfull with sequence ${descMap.data[0]} and command ${descMap.command}"
+		} else if (descMap.command == "01") {    // Default response to a command - For us it indicates unsupported request
+			if (descMap.clusterId == "0403") {
+				log.info "${device.displayName} Pressure Refresh Ignored ${descMap.data}"
+			}
 		} else if (descMap.command == "07") {  // Configuration responses
 			if (descMap.clusterId == "0001") {
 				logConfigureResponse(descMap.clusterId, "battery percentage or voltage", descMap.data[0])  // How to differentiate configure responses here for cluster 0001
@@ -167,12 +179,12 @@ def parse(String description) {
 
 void installed() {
 	log.info "${device.displayName} installed() called"
+	state.clear()
 	device.updateSetting("checkHealth",[value:"true",type:"bool"])
 	device.updateSetting("healthTimeout",[value:"12",type:"enum"])
 	device.updateSetting("temperatureOffset",[value:"0",type:"number"])
 	device.updateSetting("humidityOffset",[value:"0",type:"number"])
-	state.clear()
-	state.queuedCommand = "none"
+	updateDataValue("calcBattery", "true")	// Calculate Battery Perc until an Battery Perc event is sent
 }
 
 void uninstalled() {
@@ -185,14 +197,13 @@ void uninstalled() {
 void updated() {
 	log.info "${device.displayName} updated() called"
 	state.clear()
-	state.queuedCommand = "none"
 	resetHealthCheck()
 }
 
 def refresh() {
 	log.info "${device.displayName} refresh() requested"
 	state.clear()
-	state.queuedCommand = "refreshAll"
+	refreshAll()
 	return getRefreshCmds()
 }
 
@@ -200,7 +211,7 @@ def refresh() {
 def configure() {
 	log.info "${device.displayName} configure() requested"
 	state.clear()
-	state.queuedCommand = "none"
+	updateDataValue("calcBattery", "true")	// Calculate Battery Perc until an Battery Perc event is sent
 	resetHealthCheck()
 	return getConfigureCmds()
 }
@@ -254,35 +265,40 @@ void sendZigbeeCommands(List<String> cmds, Long delay) {
 }
 
 void resetToDefaults() {
-	state.queuedCommand = "resetToDefaults"
-	log.info "${device.displayName} queued command resetToDefaults"
+	state.clear()
+	updateDataValue("calcBattery", "true")	// Calculate Battery Perc until an Battery Perc event is sent
+	addToQueue("resetToDefaults")
 }
 
 void refreshAll() {
-	state.queuedCommand = "refreshAll"
-	log.info "${device.displayName} queued command refreshAll"
+	addToQueue("refreshAll")
 }
 
 void reconfigure() {
-	state.queuedCommand = "reconfigure"
-	log.info "${device.displayName} queued command reconfigure"
+	state.clear()
+	updateDataValue("calcBattery", "true")	// Calculate Battery Perc until an Battery Perc event is sent
+	addToQueue("reconfigure")
 }
 
 void identify() {
 	// Try sending immediately then queue it
 	sendZigbeeCommands(getIdentifyCmds(), 500)
-	state.queuedCommand = "identify"
+	addToQueue("identify")
 	log.info "${device.displayName} queued command identify"
 }
 
 List<String> getRefreshCmds() {
 	List<String> cmds = []
 
-	cmds += zigbee.readAttribute(0x0000, [0x0001, 0x0004, 0x0005, 0x0006])  // App Version, Manufacturer Name, Model ID, Date Code
-	cmds += zigbee.readAttribute(0x0001, [0x0020, 0x0021])                  // Battery Voltage & Battery % remaining
-	cmds += zigbee.readAttribute(0x0402, 0x0000)                            // Temperature
-	cmds += zigbee.readAttribute(0x0403, 0x0000)                            // Pressure
-	cmds += zigbee.readAttribute(0x0405, 0x0000)                            // Humidity
+	cmds += zigbee.readAttribute(0x0000, 0x0001)  // App Version
+	cmds += zigbee.readAttribute(0x0000, 0x0004)  // Manufacturer Name
+	cmds += zigbee.readAttribute(0x0000, 0x0005)  // Model ID
+	cmds += zigbee.readAttribute(0x0000, 0x0006)  // Date Code
+	cmds += zigbee.readAttribute(0x0001, 0x0020)  // Battery Voltage
+	cmds += zigbee.readAttribute(0x0001, 0x0021)  // Battery % remaining
+	cmds += zigbee.readAttribute(0x0402, 0x0000)  // Temperature
+	cmds += zigbee.readAttribute(0x0403, 0x0000)  // Pressure
+	cmds += zigbee.readAttribute(0x0405, 0x0000)  // Humidity
 	
 	return cmds
 }
@@ -291,11 +307,16 @@ List<String> getConfigureCmds() {
 	List<String> cmds = []
 
 	//List configureReporting(Integer clusterId, Integer attributeId, Integer dataType, Integer minReportTime, Integer maxReportTime, Integer reportableChange = null, Map additionalParams=[:], int delay = STANDARD_DELAY_INT)
-	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure temperature - Report once per hour 
-	cmds += zigbee.configureReporting(0x0403, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure Pressure - Report once per hour
-	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.INT16, 0, 3600, 100, [:], 500)  // Configure Humidity - Report once per hour
-	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery Voltage - Report once per 6hrs or if a change of 100mV detected
-	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery % - Report once per 6hrs or if a change of 1% detected
+	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 300, 3600, 100, [:], 500)  // Configure temperature - Report once per hour 
+	cmds += zigbee.configureReporting(0x0403, 0x0000, DataType.INT16, 300, 3600, 100, [:], 500)  // Configure Pressure - Report once per hour
+	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.INT16, 300, 3600, 100, [:], 500)  // Configure Humidity - Report once per hour
+	// Lumi does not report 0x0001
+	if (device.getDataValue("manufacturer") == "LUMI") {
+		cmds += zigbee.configureReporting(0x0000, 0xFF01, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Voltage - Report once per 6hrs or if a change of 100mV detected
+	} else {
+		cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Voltage - Report once per 6hrs or if a change of 100mV detected
+		cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Battery % - Report once per 6hrs or if a change of 1% detected
+	}
 
 	return cmds
 }
@@ -330,6 +351,20 @@ def intTo8bitUnsignedHex(value) {
 	return zigbee.convertToHexString(value.toInteger(), 2)
 }
 
+void addToQueue(String command) {
+	queueMap.put(device.displayName, command)
+	log.info "${device.displayName} queued command " + queueMap.get(device.displayName)
+}
+
+String removeFromQueue() {
+	String command = queueMap.get(device.displayName)
+	if (command != null) {
+		log.info "${device.displayName} reading command " + command
+		queueMap.put(device.displayName, null)
+	}
+	return command
+}
+
 private getEFFECT_BLINK() { 0 }
 private getEFFECT_BREATHE() { 1 }
 private getEFFECT_OK() { 2 }
@@ -354,20 +389,19 @@ List<String> getIdentifyCmds() {
 
 void sendDelayedCmds() {
 
-	if (state.queuedCommand != null && state.queuedCommand != "none") {
-		log.debug "${device.displayName} sending delayed command ${state.queuedCommand}"
-		if (state.queuedCommand == "resetToDefaults") {
+	String command = removeFromQueue()
+	if (command != null) {
+		log.debug "${device.displayName} sending delayed command ${command}"
+		if (command == "resetToDefaults") {
 			sendZigbeeCommands(getResetToDefaultsCmds())
-		} else if (state.queuedCommand == "refreshAll") {
+		} else if (command == "refreshAll") {
 			sendZigbeeCommands(getRefreshCmds(), 500)
-		} else if (state.queuedCommand == "reconfigure") {
+		} else if (command == "reconfigure") {
 			sendZigbeeCommands(getConfigureCmds())
-		} else if (state.queuedCommand == "identify") {
+		} else if (command == "identify") {
 			sendZigbeeCommands(getIdentifyCmds(), 500)
 		}
 	}
-	state.clear()
-	state.queuedCommand = "none"
 }
 
 def startHealthCheck() {
@@ -438,51 +472,60 @@ def batteryVoltageEvent(rawValue) {
 	if (batteryVolts > 0){
 		sendEvent("name": "voltage", "value": batteryVolts, "unit": "volts")
 		log.info "${device.displayName} voltage changed to ${batteryVolts}V calculated from raw value ${rawValue}"
-	}
 	
-	if (getDataValue("calcBattery") == null || getDataValue("calcBattery") == "true") {
-		updateDataValue("calcBattery", "true")	// We will calculate until a battery perc event occurs
-		// Guess at percentage remaining
-		// Battery percantage is not a linear relationship to voltage
-		// Should try to do this as a table with more ranges
-		def batteryValue = 100.0
-		if (rawValue < 20.01) {
-			batteryValue = 0.0
-		} else if (rawValue < 24.01) {
-			batteryValue = 10.0
-		} else if (rawValue < 25.01) {
-			batteryValue = 20.0
-		} else if (rawValue < 26.01) {
-			batteryValue = 30.0
-		} else if (rawValue < 27.01) {
-			batteryValue = 40.0
-		} else if (rawValue < 27.51) {
-			batteryValue = 50.0
-		} else if (rawValue < 28.01) {
-			batteryValue = 60.0
-		} else if (rawValue < 28.51) {
-			batteryValue = 70.0
-		} else if (rawValue < 29.01) {
-			batteryValue = 80.0
-		} else if (rawValue < 29.51) {
-			batteryValue = 90.0
+		if (getDataValue("calcBattery") == null || getDataValue("calcBattery") == "true") {
+			updateDataValue("calcBattery", "true")	// We will calculate until a battery perc event occurs
+			// Guess at percentage remaining
+			// Battery percantage is not a linear relationship to voltage
+			// Should try to do this as a table with more ranges
+			def batteryValue = 100.0
+			if (rawValue < 20.01) {
+				batteryValue = 0.0
+			} else if (rawValue < 24.01) {
+				batteryValue = 10.0
+			} else if (rawValue < 25.01) {
+				batteryValue = 20.0
+			} else if (rawValue < 26.01) {
+				batteryValue = 30.0
+			} else if (rawValue < 27.01) {
+				batteryValue = 40.0
+			} else if (rawValue < 27.51) {
+				batteryValue = 50.0
+			} else if (rawValue < 28.01) {
+				batteryValue = 60.0
+			} else if (rawValue < 28.51) {
+				batteryValue = 70.0
+			} else if (rawValue < 29.01) {
+				batteryValue = 80.0
+			} else if (rawValue < 29.51) {
+				batteryValue = 90.0
+			} else if (rawValue < 30.01) {
+				batteryValue = 92.0
+			} else if (rawValue < 30.51) {
+				batteryValue = 95.0
+			} else if (rawValue < 31.01) {
+				batteryValue = 97.0
+			} else if (rawValue < 31.51) {
+				batteryValue = 99.0
+			}
+			sendEvent("name": "battery", "value": batteryValue, "unit": "%")
+			log.info "${device.displayName} battery % remaining changed to ${batteryValue}% calculated from voltage ${batteryVolts}"
 		}
-		sendEvent("name": "battery", "value": batteryValue, "unit": "%")
-		log.info "${device.displayName} battery % remaining changed to ${batteryValue}% calculated from voltage ${batteryVolts}"
 	}
+
 }
 
 def batteryPercentageEvent(rawValue) {
 	// The BatteryPercentageRemaining attribute specifies the remaining battery life as a half integer percentage of the full battery capacity
 	// (e.g., 34.5%, 45%, 68.5%, 90%) with a range between zero and 100%, with 0x00 = 0%, 0x64 = 50%, and 0xC8 = 100%
 	// A value of 0xff indicates that the measurement is invalid.
-	updateDataValue("calcBattery", "false")	// Battery events are generated so no need to calc
 	if (rawValue != 255) {
 		Float pct = rawValue / 2
 		def batteryValue = Math.min(100, pct)
 	
 		sendEvent("name": "battery", "value": batteryValue, "unit": "%")
 		log.info "${device.displayName} battery % remaining changed to ${batteryValue}% calculated from raw value ${rawValue}"
+		updateDataValue("calcBattery", "false")	// Battery events are generated so no need to calc
 	} else {
 		log.error "${device.displayName} battery % remaining read failed"
 	}
