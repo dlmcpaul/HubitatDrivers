@@ -1,5 +1,5 @@
 /**
- *  T&E ZigBee Temperature Humidity Sensor
+ *  T&H ZigBee Temperature Humidity Sensor
  *
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -18,7 +18,6 @@
  * TODO
  * - Configuration and timings of reporting needs work (Each device has different defaults and seems to respond differently to configure commands)
  * - Understand and implement handling of the catchall events not yet recognised
- * - parse is multi-threaded which makes the queueing mechanism a problem and the various syncronisation options don't seem to work
  * 
  */
 
@@ -34,17 +33,17 @@ This driver now handles 3 manufacturer and models.  Each one responds a little d
 =================================================================================
 Device     | Default Reporting | Identify Implemented | Cluster 0000 Reporting
 =================================================================================
-T&H        | Ok                | No                   | Yes
+T&H        | Ok                | No                   | Model Id, Manufacturer Name, Version, Date Code
 ---------------------------------------------------------------------------------
-Aqara      | Ok                | No                   | No
+Aqara      | Ok                | No                   | No Reporting
 ---------------------------------------------------------------------------------
-Sonoff     | Too Fast          | Yes                  | Only Reports App Version
+Sonoff     | Too Fast          | Yes                  | Version
 =================================================================================
 
 */
 
 metadata {
-	definition (name: "T&E Temp Humidity Sensor", namespace: "hzindustries", author: "David McPaul") {
+	definition (name: "T&H Temp Humidity Sensor", namespace: "hzindustries", author: "David McPaul") {
 		capability "TemperatureMeasurement"
 		capability "RelativeHumidityMeasurement"
 		capability "PressureMeasurement"
@@ -73,7 +72,7 @@ metadata {
 	}
 }
 
-public static String version()	  {  return "v1.2.0"  }
+public static String version()	  {  return "v1.3.0"  }
 
 import groovy.transform.Field
 import java.util.concurrent.*
@@ -177,6 +176,21 @@ def parse(String description) {
 	return [:]
 }
 
+void identifyDevice() {
+    log.info "${device.displayName} trying to identify device using manufacturer ${device.getDataValue("manufacturer")} & model ${device.getDataValue("model")}"
+    
+    if ((device.getDataValue("manufacturer") == "eWeLink") && (device.getDataValue("model") == "TH01")) {
+        state.manufacturerName = "Sonoff"
+        state.deviceName = "Sonoff Temperature & Humidity Sensor"
+    } else if ((device.getDataValue("manufacturer") == "TUYATEC-Bfq2i2Sy") && (device.getDataValue("model") == "RH3052")) {
+        state.manufacturerName = "TUYATEC"
+        state.deviceName = "T&H Temperature & Humidity Sensor"
+    } else if ((device.getDataValue("manufacturer") == "LUMI") && (device.getDataValue("model") == "lumi.weather")) {
+        state.manufacturerName = "Xiaomi"
+        state.deviceName = "Aqara Smart Temperature & Humidity Sensor"
+    }
+}
+
 void installed() {
 	log.info "${device.displayName} installed() called"
 	state.clear()
@@ -185,6 +199,7 @@ void installed() {
 	device.updateSetting("temperatureOffset",[value:"0",type:"number"])
 	device.updateSetting("humidityOffset",[value:"0",type:"number"])
 	updateDataValue("calcBattery", "true")	// Calculate Battery Perc until an Battery Perc event is sent
+    identifyDevice()
 }
 
 void uninstalled() {
@@ -197,12 +212,14 @@ void uninstalled() {
 void updated() {
 	log.info "${device.displayName} updated() called"
 	state.clear()
+    identifyDevice()
 	resetHealthCheck()
 }
 
 def refresh() {
 	log.info "${device.displayName} refresh() requested"
 	state.clear()
+    identifyDevice()
 	refreshAll()
 	return getRefreshCmds()
 }
@@ -213,6 +230,8 @@ def configure() {
 	state.clear()
 	updateDataValue("calcBattery", "true")	// Calculate Battery Perc until an Battery Perc event is sent
 	resetHealthCheck()
+    identifyDevice()
+
 	return getConfigureCmds()
 }
 
@@ -290,10 +309,11 @@ void identify() {
 List<String> getRefreshCmds() {
 	List<String> cmds = []
 
-	cmds += zigbee.readAttribute(0x0000, 0x0001)  // App Version
 	cmds += zigbee.readAttribute(0x0000, 0x0004)  // Manufacturer Name
 	cmds += zigbee.readAttribute(0x0000, 0x0005)  // Model ID
+	cmds += zigbee.readAttribute(0x0000, 0x0001)  // App Version
 	cmds += zigbee.readAttribute(0x0000, 0x0006)  // Date Code
+	cmds += zigbee.readAttribute(0x0000, 0xFF01)  // Xiaomi Voltage
 	cmds += zigbee.readAttribute(0x0001, 0x0020)  // Battery Voltage
 	cmds += zigbee.readAttribute(0x0001, 0x0021)  // Battery % remaining
 	cmds += zigbee.readAttribute(0x0402, 0x0000)  // Temperature
@@ -310,8 +330,8 @@ List<String> getConfigureCmds() {
 	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 300, 3600, 100, [:], 500)  // Configure temperature - Report once per hour 
 	cmds += zigbee.configureReporting(0x0403, 0x0000, DataType.INT16, 300, 3600, 100, [:], 500)  // Configure Pressure - Report once per hour
 	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.INT16, 300, 3600, 100, [:], 500)  // Configure Humidity - Report once per hour
-	// Lumi does not report 0x0001
-	if (device.getDataValue("manufacturer") == "LUMI") {
+	// Xiaomi does not report battery using 0x0001
+	if (state.manufacturerName == "Xiaomi") {
 		cmds += zigbee.configureReporting(0x0000, 0xFF01, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Voltage - Report once per 6hrs or if a change of 100mV detected
 	} else {
 		cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 21600, 1, [:], 500)   // Configure Voltage - Report once per 6hrs or if a change of 100mV detected
@@ -324,8 +344,12 @@ List<String> getConfigureCmds() {
 List<String> getResetToDefaultsCmds() {
 	List<String> cmds = []
 
-	cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery Voltage reporting to default
-	cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery % reporting to default
+    if (state.manufacturerName == "Xiaomi") {
+        cmds += zigbee.configureReporting(0x0000, 0xFF01, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery Voltage reporting to default
+    } else {
+        cmds += zigbee.configureReporting(0x0001, 0x0020, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery Voltage reporting to default
+	    cmds += zigbee.configureReporting(0x0001, 0x0021, DataType.UINT8, 0, 0xFFFF, null, [:], 500)	// Reset Battery % reporting to default
+    }
 	cmds += zigbee.configureReporting(0x0402, 0x0000, DataType.INT16, 0, 0xFFFF, null, [:], 500)	// Reset Temperature reporting to default (looks to be 1/2 hr reporting)
 	cmds += zigbee.configureReporting(0x0403, 0x0000, DataType.INT16, 0, 0xFFFF, null, [:], 500)	// Reset Pressure reporting to default (looks to be 1/2 hr reporting)
 	cmds += zigbee.configureReporting(0x0405, 0x0000, DataType.UINT16, 0, 0xFFFF, null, [:], 500)   // Reset Humidity reporting to default (looks to be 1/2 hr reporting)
@@ -479,35 +503,61 @@ def batteryVoltageEvent(rawValue) {
 			// Battery percantage is not a linear relationship to voltage
 			// Should try to do this as a table with more ranges
 			def batteryValue = 100.0
-			if (rawValue < 20.01) {
-				batteryValue = 0.0
-			} else if (rawValue < 24.01) {
-				batteryValue = 10.0
-			} else if (rawValue < 25.01) {
-				batteryValue = 20.0
-			} else if (rawValue < 26.01) {
-				batteryValue = 30.0
-			} else if (rawValue < 27.01) {
-				batteryValue = 40.0
-			} else if (rawValue < 27.51) {
-				batteryValue = 50.0
-			} else if (rawValue < 28.01) {
-				batteryValue = 60.0
-			} else if (rawValue < 28.51) {
-				batteryValue = 70.0
-			} else if (rawValue < 29.01) {
-				batteryValue = 80.0
-			} else if (rawValue < 29.51) {
-				batteryValue = 90.0
-			} else if (rawValue < 30.01) {
-				batteryValue = 92.0
-			} else if (rawValue < 30.51) {
-				batteryValue = 95.0
-			} else if (rawValue < 31.01) {
-				batteryValue = 97.0
-			} else if (rawValue < 31.51) {
-				batteryValue = 99.0
-			}
+            if (state.manufacturerName == "TUYATEC") {
+                // Battery used is a 3V Battery
+    			if (rawValue < 20.01) {
+	    			batteryValue = 0.0
+		    	} else if (rawValue < 24.01) {
+			    	batteryValue = 10.0
+			    } else if (rawValue < 25.01) {
+			    	batteryValue = 20.0
+			    } else if (rawValue < 26.01) {
+			    	batteryValue = 30.0
+			    } else if (rawValue < 27.01) {
+				    batteryValue = 40.0
+			    } else if (rawValue < 27.51) {
+				    batteryValue = 50.0
+    			} else if (rawValue < 28.01) {
+	    			batteryValue = 60.0
+		    	} else if (rawValue < 28.51) {
+			    	batteryValue = 75.0
+    			} else if (rawValue < 29.01) {
+	    			batteryValue = 95.0
+		    	} else if (rawValue <= 29.99) {
+			    	batteryValue = 99.0
+			    }
+            } else {
+                // Battery used is a 3.2V Battery
+    			if (rawValue < 20.01) {
+	    			batteryValue = 0.0
+		    	} else if (rawValue < 24.01) {
+			    	batteryValue = 10.0
+			    } else if (rawValue < 25.01) {
+			    	batteryValue = 20.0
+			    } else if (rawValue < 26.01) {
+			    	batteryValue = 30.0
+			    } else if (rawValue < 27.01) {
+				    batteryValue = 40.0
+			    } else if (rawValue < 27.51) {
+				    batteryValue = 50.0
+    			} else if (rawValue < 28.01) {
+	    			batteryValue = 60.0
+		    	} else if (rawValue < 28.51) {
+			    	batteryValue = 70.0
+    			} else if (rawValue < 29.01) {
+	    			batteryValue = 80.0
+		    	} else if (rawValue < 29.51) {
+			    	batteryValue = 90.0
+    			} else if (rawValue < 30.01) {
+	    			batteryValue = 92.0
+		    	} else if (rawValue < 30.51) {
+			    	batteryValue = 95.0
+    			} else if (rawValue < 31.01) {
+	    			batteryValue = 97.0
+		    	} else if (rawValue < 31.51) {
+			    	batteryValue = 99.0
+			    }
+            }
 			sendEvent("name": "battery", "value": batteryValue, "unit": "%")
 			log.info "${device.displayName} battery % remaining changed to ${batteryValue}% calculated from voltage ${batteryVolts}"
 		}
@@ -531,7 +581,7 @@ def batteryPercentageEvent(rawValue) {
 	}
 }
 
-// Not sure if using the precense sensor is good for this?
+// Not sure if using the presence sensor is good for this?
 def present() {
 	sendEvent("name": "presence", "value":  "present", isStateChange: true)
 	log.info "${device.displayName} contact changed to present"
