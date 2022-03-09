@@ -30,15 +30,15 @@
 
 This driver now handles 3 manufacturer and models.  Each one responds a little different despite being the same profile and returning the same values (temp/humidity)
 
-=================================================================================
-Device     | Default Reporting | Identify Implemented | Cluster 0000 Reporting
-=================================================================================
-T&H        | Ok                | No                   | Model Id, Manufacturer Name, Version, Date Code
----------------------------------------------------------------------------------
-Aqara      | Ok                | No                   | No Reporting
----------------------------------------------------------------------------------
-Sonoff     | Too Fast          | Yes                  | Version
-=================================================================================
+=====================================================================================================================
+Device     | Default Reporting | Identify Implemented | Cluster 0000 Reporting                           | Battery
+=====================================================================================================================
+T&H        | Ok                | No                   | Model Id, Manufacturer Name, Version, Date Code  | 3V (CR2032)
+---------------------------------------------------------------------------------------------------------------------
+Aqara      | Ok                | No                   | No Reporting                                     | 3.2V
+---------------------------------------------------------------------------------------------------------------------
+Sonoff     | Too Fast          | Yes                  | Version                                          | 3.2V
+=====================================================================================================================
 
 */
 
@@ -72,7 +72,7 @@ metadata {
 	}
 }
 
-public static String version()	  {  return "v1.3.0"  }
+public static String version()	  {  return "v1.3.1"  }
 
 import groovy.transform.Field
 import java.util.concurrent.*
@@ -106,6 +106,7 @@ def parse(String description) {
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0004") {
 			log.info "${device.displayName} Manufacturer Name ${descMap.value}"
 			state.manufacturerName = descMap.value
+            identifyDevice()
 		} else if (descMap.cluster == "0000" && descMap.attrId == "0005") {
 			log.info "${device.displayName} Model ID ${descMap.value}"
 			state.modelId = descMap.value
@@ -188,6 +189,9 @@ void identifyDevice() {
     } else if ((device.getDataValue("manufacturer") == "LUMI") && (device.getDataValue("model") == "lumi.weather")) {
         state.manufacturerName = "Xiaomi"
         state.deviceName = "Aqara Smart Temperature & Humidity Sensor"
+    } else {
+        state.manufacturerName = device.getDataValue("manufacturer")
+        state.deviceName = device.getDataValue("model")
     }
 }
 
